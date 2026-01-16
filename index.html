@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voice Bot – MP4 Avatar</title>
+
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #000;
+    }
+
+    .stage{
+      position: relative;
+      width: min(720px, calc(100vw - 24px));
+      aspect-ratio: 1 / 1;
+      margin: 0 auto;
+      display: grid;
+      place-items: center;
+    }
+
+    video{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: #000;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="stage">
+    <video
+      id="avatarVideo"
+      src="./SKO NiCY Animation Speech.mp4"
+      autoplay
+      muted
+      playsinline
+      loop
+    ></video>
+  </div>
+
+  <!-- Cognigy WebRTC Widget -->
+  <script src="https://static-trial.cognigy.ai/webrtc/webRTCWidget.js"></script>
+  <script>
+    addEventListener("load", () => {
+      if (window.initWebRTCWidget) {
+        window.initWebRTCWidget(
+          "https://endpoint-trial-us.cognigy.ai/43947422bffcca503a42c2b9b03611a5f85c57045d9a05957c16111e450de980"
+        );
+      }
+    });
+  </script>
+
+  <script>
+    const video = document.getElementById("avatarVideo");
+
+    /* =========================================================
+       CONFIG – TUNE THESE ONCE
+       ========================================================= */
+
+    // 👉 Replace these with your real values
+    const TALK_START = 0.80;   // seconds
+    const TALK_END   = 2.10;   // seconds
+
+    const IDLE_RATE  = 1.0;
+    const TALK_RATE  = 1.12;
+
+    const AUDIO_THRESHOLD = 0.02;
+    const AUDIO_GAIN = 12;
+    const SMOOTHING = 0.12;
+
+    /* ========================================================= */
+
+    let audioCtx, analyser, data;
+    let speaking = false;
+    let last = 0;
+
+    function computeRMS(buf){
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++){
+        const v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / buf.length);
+    }
+
+    function setSpeaking(on){
+      if (on === speaking) return;
+      speaking = on;
+
+      if (speaking){
+        video.loop = false;
+        video.playbackRate = TALK_RATE;
+        if (video.currentTime < TALK_START || video.currentTime > TALK_END){
+          video.currentTime = TALK_START + 0.01;
+        }
+      } else {
+        video.playbackRate = IDLE_RATE;
+        video.loop = true;
+      }
+    }
+
+    // Keep looping the talking segment
+    video.addEventListener("timeupdate", () => {
+      if (speaking && video.currentTime >= TALK_END){
+        video.currentTime = TALK_START + 0.01;
+      }
+    });
+
+    async function hookBotAudio(){
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      await audioCtx.resume();
+
+      // Find widget audio
+      const findAudio = async () => {
+        const start = performance.now();
+        while (performance.now() - start < 15000){
+          const audios = Array.from(document.querySelectorAll("audio"));
+          const a =
+            audios.find(x => x.srcObject instanceof MediaStream) ||
+            audios.find(x => !x.paused) ||
+            audios[0];
+          if (a) return a;
+          await new Promise(r => setTimeout(r, 150));
+        }
+        return null;
+      };
+
+      const audioEl = await findAudio();
+      if (!audioEl) return;
+
+      const source = (audioEl.srcObject instanceof MediaStream)
+        ? audioCtx.createMediaStreamSource(audioEl.srcObject)
+        : audioCtx.createMediaElementSource(audioEl);
+
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      data = new Uint8Array(analyser.fftSize);
+
+      source.connect(analyser);
+
+      const loop = () => {
+        analyser.getByteTimeDomainData(data);
+        const rms = computeRMS(data);
+        const raw = Math.max(0, (rms - AUDIO_THRESHOLD) * AUDIO_GAIN);
+        const level = Math.min(1, raw);
+
+        last = last * SMOOTHING + level * (1 - SMOOTHING);
+        setSpeaking(last > 0.08);
+
+        requestAnimationFrame(loop);
+      };
+      loop();
+    }
+
+    // Arm on first user interaction (clicking widget call button counts)
+    let armed = false;
+    window.addEventListener("pointerdown", () => {
+      if (armed) return;
+      armed = true;
+      hookBotAudio().catch(()=>{});
+    }, { capture: true });
+  </script>
+</body>
+</html>
