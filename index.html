@@ -3,10 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Voice Bot – MP4 Avatar (Talk Only On Bot Audio)</title>
+  <title>Voice Bot – MP4 Avatar</title>
 
   <style>
-    html, body { height: 100%; margin: 0; background: #000; }
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #000;
+    }
     .stage{
       position: relative;
       width: min(720px, calc(100vw - 24px));
@@ -37,30 +41,58 @@
   </div>
 
   <!-- =========================================================
-       HOOKS (must be BEFORE widget loads)
+       GLOBAL MEDIA MUTE (RING SUPPRESSION – SAFE)
        ========================================================= -->
-
-  <!-- RTCPeerConnection hook -->
   <script>
     (function () {
-      window.__lipTap = { stream: null, pcSeen: 0, onStream: null };
+      if (window.__mediaMuteInstalled) return;
+      window.__mediaMuteInstalled = true;
+
+      const proto = HTMLMediaElement.prototype;
+      const origPlay = proto.play;
+
+      window.__forceMediaMuted = true;
+
+      proto.play = function () {
+        this.muted = window.__forceMediaMuted;
+        return origPlay.apply(this, arguments);
+      };
+
+      function muteAll() {
+        document.querySelectorAll("audio,video")
+          .forEach(m => m.muted = true);
+      }
+      function unmuteAll() {
+        document.querySelectorAll("audio,video")
+          .forEach(m => m.muted = false);
+      }
+
+      window.__muteAllMedia = muteAll;
+      window.__unmuteAllMedia = unmuteAll;
+
+      muteAll(); // mute immediately on load
+    })();
+  </script>
+
+  <!-- =========================================================
+       WebRTC TRACK TAP (for lip-sync)
+       ========================================================= -->
+  <script>
+    (function () {
+      window.__lipTap = { stream: null, onStream: null };
 
       const OrigPC = window.RTCPeerConnection;
       if (!OrigPC) return;
 
       function WrappedPC(...args) {
         const pc = new OrigPC(...args);
-        window.__lipTap.pcSeen++;
-
-        pc.addEventListener("track", (ev) => {
-          const track = ev.track;
-          if (track && track.kind === "audio") {
-            const stream = (ev.streams && ev.streams[0]) ? ev.streams[0] : new MediaStream([track]);
+        pc.addEventListener("track", ev => {
+          if (ev.track && ev.track.kind === "audio") {
+            const stream = ev.streams?.[0] || new MediaStream([ev.track]);
             window.__lipTap.stream = stream;
-            if (typeof window.__lipTap.onStream === "function") window.__lipTap.onStream(stream);
+            if (window.__lipTap.onStream) window.__lipTap.onStream(stream);
           }
         });
-
         return pc;
       }
       WrappedPC.prototype = OrigPC.prototype;
@@ -68,179 +100,140 @@
     })();
   </script>
 
-  <!-- Cognigy WebRTC Widget -->
+  <!-- =========================================================
+       Cognigy WebRTC Widget
+       ========================================================= -->
   <script src="https://static-trial.cognigy.ai/webrtc/webRTCWidget.js"></script>
   <script>
     addEventListener("load", () => {
-      if (window.initWebRTCWidget) {
-        window.initWebRTCWidget(
-          "https://endpoint-trial-us.cognigy.ai/43947422bffcca503a42c2b9b03611a5f85c57045d9a05957c16111e450de980"
-        );
-      }
+      window.initWebRTCWidget?.(
+        "https://endpoint-trial-us.cognigy.ai/43947422bffcca503a42c2b9b03611a5f85c57045d9a05957c16111e450de980"
+      );
     });
   </script>
 
+  <!-- =========================================================
+       MP4 LIP SYNC ENGINE
+       ========================================================= -->
   <script>
     const video = document.getElementById("avatarVideo");
 
-    /* ===================== CONFIG ===================== */
-
-    const IDLE_HOLD_TIME = 0.00;  // choose a neutral frame if needed (e.g., 0.20)
-
-    const TALK_START = 0.00;
+    const IDLE_FRAME = 0.0;
+    const TALK_START = 0.0;
     const TALK_END   = 3.98;
     const TALK_RATE  = 1.08;
 
-    // Your RMS looks healthy; these are safe thresholds
-    const SMOOTHING  = 0.10;
     const SPEAK_ON   = 0.010;
     const SPEAK_OFF  = 0.006;
-
-    // Prevent flicker/races: keep talking for at least this long once it starts
+    const SMOOTHING  = 0.10;
     const MIN_TALK_MS = 250;
 
-    const DEBUG = false; // set true if you want logs
-
-    /* ================================================== */
-
-    let armed = false;
+    let mode = "idle";
+    let lastTalkStart = 0;
     let bound = false;
 
-    let audioCtx = null;
-    let analyser = null;
-    let data = null;
-    let raf = null;
+    function now(){ return performance.now(); }
 
-    // Video state machine
-    let mode = "idle"; // "idle" | "talk"
-    let lastTalkStartMs = 0;
-
-    function nowMs(){ return performance.now(); }
-
-    function setModeIdle() {
+    function idle(){
       if (mode === "idle") return;
       mode = "idle";
-
-      // Pause & hold
       video.pause();
-      try { video.currentTime = IDLE_HOLD_TIME; } catch {}
-      if (DEBUG) console.log("[mp4] MODE -> idle");
+      try { video.currentTime = IDLE_FRAME; } catch {}
     }
 
-    async function setModeTalk() {
+    async function talk(){
       if (mode === "talk") return;
       mode = "talk";
-      lastTalkStartMs = nowMs();
-
+      lastTalkStart = now();
       video.loop = false;
       video.playbackRate = TALK_RATE;
       try { video.currentTime = TALK_START + 0.01; } catch {}
-
-      try { await video.play(); } catch (e) {
-        if (DEBUG) console.log("[mp4] video.play() failed:", e);
-      }
-      if (DEBUG) console.log("[mp4] MODE -> talk");
+      try { await video.play(); } catch {}
     }
 
-    // On load: freeze once metadata is ready (NO "play" handler; that caused the race)
     video.addEventListener("loadedmetadata", () => {
       video.pause();
-      try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+      video.currentTime = IDLE_FRAME;
     });
 
-    // Loop the talk segment while in talk mode
     video.addEventListener("timeupdate", () => {
       if (mode === "talk" && video.currentTime >= TALK_END) {
         video.currentTime = TALK_START + 0.01;
       }
     });
 
-    function computeRMS(buf){
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++){
-        const x = (buf[i] - 128) / 128;
-        sum += x * x;
+    function rms(buf){
+      let s=0;
+      for (let i=0;i<buf.length;i++){
+        const x=(buf[i]-128)/128;
+        s+=x*x;
       }
-      return Math.sqrt(sum / buf.length);
+      return Math.sqrt(s/buf.length);
     }
 
-    function stopAnalyser(){
-      if (raf) cancelAnimationFrame(raf);
-      raf = null;
-    }
+    async function startLipSync(stream){
+      if (bound) return;
+      bound = true;
 
-    async function startAnalyserFromStream(stream){
-      stopAnalyser();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      await ctx.resume();
 
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      await audioCtx.resume();
+      const src = ctx.createMediaStreamSource(stream);
+      const an  = ctx.createAnalyser();
+      an.fftSize = 1024;
+      const data = new Uint8Array(an.fftSize);
 
-      const source = audioCtx.createMediaStreamSource(stream);
+      const g = ctx.createGain();
+      g.gain.value = 0;
 
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 1024;
-      data = new Uint8Array(analyser.fftSize);
-
-      // Keep graph alive (silent)
-      const zero = audioCtx.createGain();
-      zero.gain.value = 0;
-
-      source.connect(analyser);
-      analyser.connect(zero);
-      zero.connect(audioCtx.destination);
-
-      if (DEBUG) console.log("[mp4] analyser started");
+      src.connect(an);
+      an.connect(g);
+      g.connect(ctx.destination);
 
       let last = 0;
 
       const loop = async () => {
-        analyser.getByteTimeDomainData(data);
+        an.getByteTimeDomainData(data);
+        const v = rms(data);
+        last = last * SMOOTHING + v * (1 - SMOOTHING);
 
-        const rms = computeRMS(data);
-        last = last * SMOOTHING + rms * (1 - SMOOTHING);
-
-        // Decide talking / idle with debounce
         if (mode !== "talk" && last >= SPEAK_ON) {
-          await setModeTalk();
+          await talk();
         } else if (mode === "talk") {
-          const elapsed = nowMs() - lastTalkStartMs;
-
-          // Only allow turning off after MIN_TALK_MS
-          if (elapsed >= MIN_TALK_MS && last <= SPEAK_OFF) {
-            setModeIdle();
+          if (now() - lastTalkStart > MIN_TALK_MS && last <= SPEAK_OFF) {
+            idle();
           }
         }
-
-        raf = requestAnimationFrame(loop);
+        requestAnimationFrame(loop);
       };
       loop();
     }
 
-    function bindOnceFromStream(stream){
-      if (bound) return;
-      bound = true;
-      if (DEBUG) console.log("[mp4] bound from WebRTC track stream");
-      startAnalyserFromStream(stream).catch(e => DEBUG && console.log("[mp4] analyser error:", e));
-    }
-
-    // Arm on first user gesture (clicking widget call button counts)
+    // =========================================================
+    // CALL CLICK HANDLER
+    // =========================================================
     window.addEventListener("pointerdown", () => {
-      if (armed) return;
-      armed = true;
+      if (window.__callArmed) return;
+      window.__callArmed = true;
 
-      // Start in idle mode
-      setModeIdle();
+      // 🔇 Mute ring immediately
+      window.__forceMediaMuted = true;
+      window.__muteAllMedia();
 
-      // Bind to WebRTC track stream as soon as it arrives
+      // 🔊 Release after 2s (adjust here)
+      setTimeout(() => {
+        window.__forceMediaMuted = false;
+        window.__unmuteAllMedia();
+      }, 2000);
+
+      idle();
+
       if (window.__lipTap) {
-        window.__lipTap.onStream = (s) => bindOnceFromStream(s);
-        if (window.__lipTap.stream) bindOnceFromStream(window.__lipTap.stream);
+        window.__lipTap.onStream = s => startLipSync(s);
+        if (window.__lipTap.stream) startLipSync(window.__lipTap.stream);
       }
-    }, { capture: true });
-
-    // Initial freeze (in case metadata already loaded)
-    video.pause();
-    try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+    }, { capture:true });
   </script>
 </body>
 </html>
