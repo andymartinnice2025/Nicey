@@ -36,77 +36,6 @@
     ></video>
   </div>
 
-  <!-- =========================================================
-       HOOKS (must be BEFORE widget loads)
-       ========================================================= -->
-
-  <!-- 1) RTCPeerConnection hook -->
-  <script>
-    (function () {
-      window.__lipTap = { stream: null, pcSeen: 0, onStream: null };
-
-      const OrigPC = window.RTCPeerConnection;
-      if (!OrigPC) return;
-
-      function WrappedPC(...args) {
-        const pc = new OrigPC(...args);
-        window.__lipTap.pcSeen++;
-
-        pc.addEventListener("track", (ev) => {
-          const track = ev.track;
-          if (track && track.kind === "audio") {
-            const stream = (ev.streams && ev.streams[0]) ? ev.streams[0] : new MediaStream([track]);
-            window.__lipTap.stream = stream;
-            if (typeof window.__lipTap.onStream === "function") window.__lipTap.onStream(stream);
-          }
-        });
-        return pc;
-      }
-      WrappedPC.prototype = OrigPC.prototype;
-      window.RTCPeerConnection = WrappedPC;
-    })();
-  </script>
-
-  <!-- 2) AudioContext hook -->
-  <script>
-    (function () {
-      const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
-      if (!OriginalAudioContext) return;
-
-      window.__audioTap = { ctx: null, source: null, onSource: null };
-
-      function WrappedAudioContext(...args) {
-        const ctx = new OriginalAudioContext(...args);
-        window.__audioTap.ctx = ctx;
-
-        if (ctx.createMediaStreamSource) {
-          const orig = ctx.createMediaStreamSource.bind(ctx);
-          ctx.createMediaStreamSource = function (stream) {
-            const src = orig(stream);
-            window.__audioTap.source = src;
-            if (typeof window.__audioTap.onSource === "function") window.__audioTap.onSource(ctx, src);
-            return src;
-          };
-        }
-
-        if (ctx.createMediaElementSource) {
-          const origEl = ctx.createMediaElementSource.bind(ctx);
-          ctx.createMediaElementSource = function (el) {
-            const src = origEl(el);
-            window.__audioTap.source = src;
-            if (typeof window.__audioTap.onSource === "function") window.__audioTap.onSource(ctx, src);
-            return src;
-          };
-        }
-
-        return ctx;
-      }
-      WrappedAudioContext.prototype = OriginalAudioContext.prototype;
-      window.AudioContext = WrappedAudioContext;
-      if (window.webkitAudioContext) window.webkitAudioContext = WrappedAudioContext;
-    })();
-  </script>
-
   <!-- Cognigy WebRTC Widget -->
   <script src="https://static-trial.cognigy.ai/webrtc/webRTCWidget.js"></script>
   <script>
@@ -122,28 +51,24 @@
   <script>
     const video = document.getElementById("avatarVideo");
 
-    /* =========================================================
-       CONFIG
-       ========================================================= */
+    /* ===================== CONFIG ===================== */
 
-    // Hold still here while silent (adjust if this frame has mouth movement)
+    // Hold still on this frame while silent (change if that frame has mouth movement)
     const IDLE_HOLD_TIME = 0.00;
 
-    // Use full clip for talk loop (avoid exact end)
+    // Talk loop: full ~4s clip
     const TALK_START = 0.00;
     const TALK_END   = 3.98;
-
     const TALK_RATE  = 1.08;
 
-    // More sensitive defaults (since you reported no motion)
-    const AUDIO_THRESHOLD = 0.012; // was 0.018
-    const AUDIO_GAIN = 16.0;       // was 12
+    // Make it sensitive (you reported no movement)
+    const AUDIO_THRESHOLD = 0.012;
+    const AUDIO_GAIN = 16.0;
+    const SMOOTHING = 0.08;
+    const SPEAK_ON  = 0.035;
+    const SPEAK_OFF = 0.020;
 
-    const SMOOTHING = 0.08;        // faster response
-    const SPEAK_ON  = 0.035;       // start earlier
-    const SPEAK_OFF = 0.020;       // stop later (hysteresis)
-
-    /* ========================================================= */
+    /* ================================================== */
 
     let speaking = false;
     let last = 0;
@@ -154,11 +79,12 @@
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
     }
 
-    // Hard-freeze on load and whenever browser tries to play while not speaking
+    // Freeze aggressively until speaking=true
     video.addEventListener("loadedmetadata", holdIdleFrame);
     video.addEventListener("canplay", holdIdleFrame);
     video.addEventListener("play", () => { if (!speaking) holdIdleFrame(); });
 
+    // Loop talk segment only while speaking
     video.addEventListener("timeupdate", () => {
       if (speaking && video.currentTime >= TALK_END) {
         video.currentTime = TALK_START + 0.01;
@@ -193,16 +119,91 @@
       raf = null;
     }
 
-    async function startAnalyserFromNode(audioCtx, sourceNode){
+    /* ---------- Shadow DOM deep search for <audio> ---------- */
+
+    function collectAudiosDeep(root, out, seen) {
+      if (!root || seen.has(root)) return;
+      seen.add(root);
+
+      // If root is an Element, check if it's <audio>
+      if (root.nodeType === 1) {
+        const el = root;
+        if (el.tagName === "AUDIO") out.push(el);
+
+        // Explore shadow root if present
+        if (el.shadowRoot) collectAudiosDeep(el.shadowRoot, out, seen);
+
+        // Explore children
+        for (const child of el.children) collectAudiosDeep(child, out, seen);
+      } else if (root.nodeType === 11) {
+        // DocumentFragment / ShadowRoot
+        const frag = root;
+        // Query audio inside this fragment
+        const audios = frag.querySelectorAll ? frag.querySelectorAll("audio") : [];
+        for (const a of audios) out.push(a);
+
+        // Explore element children of the fragment
+        if (frag.children) {
+          for (const child of frag.children) collectAudiosDeep(child, out, seen);
+        } else if (frag.childNodes) {
+          for (const node of frag.childNodes) collectAudiosDeep(node, out, seen);
+        }
+      } else if (root.childNodes) {
+        for (const node of root.childNodes) collectAudiosDeep(node, out, seen);
+      }
+    }
+
+    function findAudioDeep() {
+      const out = [];
+      collectAudiosDeep(document.documentElement, out, new WeakSet());
+
+      // De-dupe
+      const unique = Array.from(new Set(out));
+
+      // Prefer playing / stream-backed audio
+      return (
+        unique.find(a => a.srcObject instanceof MediaStream) ||
+        unique.find(a => !a.paused && (a.currentSrc || a.src)) ||
+        unique[0] ||
+        null
+      );
+    }
+
+    async function hookBotAudio(){
       stopAudioLoop();
 
-      const analyser = audioCtx.createAnalyser();
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) return;
+
+      const ctx = new AudioContextCtor();
+      await ctx.resume();
+
+      // Wait until the widget creates audio (even in Shadow DOM)
+      const start = performance.now();
+      let audioEl = null;
+
+      while (performance.now() - start < 20000) {
+        audioEl = findAudioDeep();
+        if (audioEl) break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      if (!audioEl) {
+        console.log("[mp4-sync] No audio found (even via Shadow DOM). If widget runs in cross-origin iframe, audio is inaccessible.");
+        return;
+      }
+
+      console.log("[mp4-sync] Found audio via deep search:", audioEl);
+
+      const source = (audioEl.srcObject instanceof MediaStream)
+        ? ctx.createMediaStreamSource(audioEl.srcObject)
+        : ctx.createMediaElementSource(audioEl);
+
+      const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
       const data = new Uint8Array(analyser.fftSize);
 
-      sourceNode.connect(analyser);
-
-      console.log("[lip] analyser started");
+      source.connect(analyser);
 
       const loop = async () => {
         analyser.getByteTimeDomainData(data);
@@ -213,8 +214,6 @@
 
         last = last * SMOOTHING + level * (1 - SMOOTHING);
 
-        // console.log("[lip]", "rms", rms.toFixed(4), "lvl", last.toFixed(3));
-
         if (!speaking && last >= SPEAK_ON) await setSpeaking(true);
         else if (speaking && last <= SPEAK_OFF) await setSpeaking(false);
 
@@ -223,70 +222,14 @@
       loop();
     }
 
-    async function tryBindFromAudioElement(){
-      const audios = Array.from(document.querySelectorAll("audio"));
-      const a =
-        audios.find(x => x.srcObject instanceof MediaStream) ||
-        audios.find(x => !x.paused) ||
-        audios[0];
-
-      if (!a) return false;
-
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      await ctx.resume();
-
-      const source = (a.srcObject instanceof MediaStream)
-        ? ctx.createMediaStreamSource(a.srcObject)
-        : ctx.createMediaElementSource(a);
-
-      console.log("[lip] bound from <audio>");
-      await startAnalyserFromNode(ctx, source);
-      return true;
-    }
-
-    async function bindFromPeerStream(stream){
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      await ctx.resume();
-      const source = ctx.createMediaStreamSource(stream);
-      console.log("[lip] bound from WebRTC track");
-      await startAnalyserFromNode(ctx, source);
-    }
-
-    async function bindFromAudioHook(ctx, src){
-      try { await ctx.resume(); } catch {}
-      console.log("[lip] bound from AudioContext hook");
-      await startAnalyserFromNode(ctx, src);
-    }
-
-    // Arm everything on first user interaction (call click)
+    // Arm on first user interaction (clicking the call button counts)
     let armed = false;
-    window.addEventListener("pointerdown", async () => {
+    window.addEventListener("pointerdown", () => {
       if (armed) return;
       armed = true;
 
       holdIdleFrame();
-
-      // Event-driven bindings
-      if (window.__lipTap) window.__lipTap.onStream = (s) => bindFromPeerStream(s).catch(()=>{});
-      if (window.__audioTap) window.__audioTap.onSource = (c, s) => bindFromAudioHook(c, s).catch(()=>{});
-
-      // Quick poll to catch an audio element if it appears
-      const t0 = performance.now();
-      const poll = async () => {
-        if (raf) return; // already running
-        const ok = await tryBindFromAudioElement();
-        if (ok) return;
-
-        // If peer stream already exists, bind
-        if (window.__lipTap?.stream) {
-          bindFromPeerStream(window.__lipTap.stream).catch(()=>{});
-          return;
-        }
-
-        // keep trying for a bit
-        if (performance.now() - t0 < 15000) setTimeout(poll, 150);
-      };
-      poll();
+      hookBotAudio().catch(()=>{});
     }, { capture: true });
 
     // Initial freeze
@@ -294,9 +237,3 @@
   </script>
 </body>
 </html>
-
-
-
-
-
-
