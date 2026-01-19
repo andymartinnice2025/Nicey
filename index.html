@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Voice Bot – MP4 Avatar</title>
+  <title>Voice Bot – MP4 Avatar (Talk Only On Bot Audio)</title>
 
   <style>
     html, body { height: 100%; margin: 0; background: #000; }
@@ -40,7 +40,7 @@
        HOOKS (must be BEFORE widget loads)
        ========================================================= -->
 
-  <!-- RTCPeerConnection hook (lets us access the remote audio track) -->
+  <!-- RTCPeerConnection hook -->
   <script>
     (function () {
       window.__lipTap = { stream: null, pcSeen: 0, onStream: null };
@@ -85,45 +85,46 @@
 
     /* ===================== CONFIG ===================== */
 
-    // Freeze on a neutral frame while silent
-    const IDLE_HOLD_TIME = 0.00;   // try 0.20 if frame 0 isn't neutral
+    const IDLE_HOLD_TIME = 0.00;  // choose a neutral frame if needed (e.g., 0.20)
 
-    // Talk loop (full ~4s clip; avoid exact end)
     const TALK_START = 0.00;
     const TALK_END   = 3.98;
     const TALK_RATE  = 1.08;
 
-    // Speech detection (your RMS logs looked healthy)
-    const SMOOTHING   = 0.10;
-    const SPEAK_ON    = 0.010;
-    const SPEAK_OFF   = 0.006;
+    // Your RMS looks healthy; these are safe thresholds
+    const SMOOTHING  = 0.10;
+    const SPEAK_ON   = 0.010;
+    const SPEAK_OFF  = 0.006;
+
+    // Prevent flicker/races: keep talking for at least this long once it starts
     const MIN_TALK_MS = 250;
 
-    // 🔇 Ring suppression: mute ALL audio output for this long after call click
-    const RING_MUTE_MS = 2000; // adjust freely
+    const DEBUG = false; // set true if you want logs
 
     /* ================================================== */
 
     let armed = false;
     let bound = false;
 
-    // video state machine
-    let mode = "idle"; // "idle" | "talk"
-    let lastTalkStartMs = 0;
-
-    // analyser state
     let audioCtx = null;
     let analyser = null;
     let data = null;
     let raf = null;
+
+    // Video state machine
+    let mode = "idle"; // "idle" | "talk"
+    let lastTalkStartMs = 0;
 
     function nowMs(){ return performance.now(); }
 
     function setModeIdle() {
       if (mode === "idle") return;
       mode = "idle";
+
+      // Pause & hold
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+      if (DEBUG) console.log("[mp4] MODE -> idle");
     }
 
     async function setModeTalk() {
@@ -135,16 +136,19 @@
       video.playbackRate = TALK_RATE;
       try { video.currentTime = TALK_START + 0.01; } catch {}
 
-      try { await video.play(); } catch {}
+      try { await video.play(); } catch (e) {
+        if (DEBUG) console.log("[mp4] video.play() failed:", e);
+      }
+      if (DEBUG) console.log("[mp4] MODE -> talk");
     }
 
-    // Freeze once metadata is ready (prevents autoplay-like behavior)
+    // On load: freeze once metadata is ready (NO "play" handler; that caused the race)
     video.addEventListener("loadedmetadata", () => {
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
     });
 
-    // Loop talk segment while talking
+    // Loop the talk segment while in talk mode
     video.addEventListener("timeupdate", () => {
       if (mode === "talk" && video.currentTime >= TALK_END) {
         video.currentTime = TALK_START + 0.01;
@@ -177,13 +181,15 @@
       analyser.fftSize = 1024;
       data = new Uint8Array(analyser.fftSize);
 
-      // Keep graph alive (silent output)
+      // Keep graph alive (silent)
       const zero = audioCtx.createGain();
       zero.gain.value = 0;
 
       source.connect(analyser);
       analyser.connect(zero);
       zero.connect(audioCtx.destination);
+
+      if (DEBUG) console.log("[mp4] analyser started");
 
       let last = 0;
 
@@ -193,11 +199,13 @@
         const rms = computeRMS(data);
         last = last * SMOOTHING + rms * (1 - SMOOTHING);
 
-        // Normal talk/idle logic with debounce
+        // Decide talking / idle with debounce
         if (mode !== "talk" && last >= SPEAK_ON) {
           await setModeTalk();
         } else if (mode === "talk") {
           const elapsed = nowMs() - lastTalkStartMs;
+
+          // Only allow turning off after MIN_TALK_MS
           if (elapsed >= MIN_TALK_MS && last <= SPEAK_OFF) {
             setModeIdle();
           }
@@ -211,33 +219,8 @@
     function bindOnceFromStream(stream){
       if (bound) return;
       bound = true;
-      startAnalyserFromStream(stream).catch(()=>{});
-    }
-
-    /* =========================================================
-       GLOBAL AUDIO MUTE (RING KILL)
-       =========================================================
-       This is a demo-safe blunt tool: it mutes ALL audio output for
-       RING_MUTE_MS immediately after clicking start call, then releases.
-       ========================================================= */
-
-    let globalMuteCtx = null;
-
-    async function muteAllAudioFor(ms){
-      try{
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return;
-
-        if (!globalMuteCtx) globalMuteCtx = new AC();
-
-        // Ensure it's running then suspend to silence output
-        await globalMuteCtx.resume();
-        await globalMuteCtx.suspend();
-
-        setTimeout(async () => {
-          try { await globalMuteCtx.resume(); } catch {}
-        }, ms);
-      } catch {}
+      if (DEBUG) console.log("[mp4] bound from WebRTC track stream");
+      startAnalyserFromStream(stream).catch(e => DEBUG && console.log("[mp4] analyser error:", e));
     }
 
     // Arm on first user gesture (clicking widget call button counts)
@@ -245,22 +228,17 @@
       if (armed) return;
       armed = true;
 
-      // 🔇 Kill the ring (adjust RING_MUTE_MS at top)
-      muteAllAudioFor(RING_MUTE_MS);
+      // Start in idle mode
+      setModeIdle();
 
-      // Start in idle frame immediately
-      mode = "idle";
-      video.pause();
-      try { video.currentTime = IDLE_HOLD_TIME; } catch {}
-
-      // Bind to WebRTC stream when it arrives
+      // Bind to WebRTC track stream as soon as it arrives
       if (window.__lipTap) {
         window.__lipTap.onStream = (s) => bindOnceFromStream(s);
         if (window.__lipTap.stream) bindOnceFromStream(window.__lipTap.stream);
       }
     }, { capture: true });
 
-    // Initial freeze
+    // Initial freeze (in case metadata already loaded)
     video.pause();
     try { video.currentTime = IDLE_HOLD_TIME; } catch {}
   </script>
