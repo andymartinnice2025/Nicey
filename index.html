@@ -3,11 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Voice Bot – MP4 Avatar (Animate on Bot Audio)</title>
+  <title>Voice Bot – MP4 Avatar (Talk Only On Bot Audio)</title>
 
   <style>
     html, body { height: 100%; margin: 0; background: #000; }
-
     .stage{
       position: relative;
       width: min(720px, calc(100vw - 24px));
@@ -16,7 +15,6 @@
       display: grid;
       place-items: center;
     }
-
     video{
       width: 100%;
       height: 100%;
@@ -87,53 +85,72 @@
 
     /* ===================== CONFIG ===================== */
 
-    // Choose a neutral-looking frame here
-    const IDLE_HOLD_TIME = 0.00;
+    const IDLE_HOLD_TIME = 0.00;  // choose a neutral frame if needed (e.g., 0.20)
 
-    // Talk loop: use almost full clip, avoid exact end
     const TALK_START = 0.00;
     const TALK_END   = 3.98;
     const TALK_RATE  = 1.08;
 
-    // ULTRA-sensitive defaults (we'll also auto-adapt)
-    const SMOOTHING = 0.08;
+    // Your RMS looks healthy; these are safe thresholds
+    const SMOOTHING  = 0.10;
+    const SPEAK_ON   = 0.010;
+    const SPEAK_OFF  = 0.006;
 
-    // Speaking thresholds (very low)
-    let SPEAK_ON  = 0.010;   // start talking
-    let SPEAK_OFF = 0.006;   // stop talking
+    // Prevent flicker/races: keep talking for at least this long once it starts
+    const MIN_TALK_MS = 250;
 
-    // For auto-adaptive noise floor (first ~2s)
-    const CALIBRATION_MS = 2000;
-    const ON_MULT  = 4.0;    // speak_on = noiseFloor * ON_MULT
-    const OFF_MULT = 2.6;    // speak_off = noiseFloor * OFF_MULT
-
-    // Debug logging
-    const DEBUG = true; // set false once stable
+    const DEBUG = false; // set true if you want logs
 
     /* ================================================== */
 
     let armed = false;
     let bound = false;
-    let speaking = false;
 
     let audioCtx = null;
     let analyser = null;
     let data = null;
     let raf = null;
 
-    // Freeze the MP4 until speaking=true
-    function holdIdleFrame() {
+    // Video state machine
+    let mode = "idle"; // "idle" | "talk"
+    let lastTalkStartMs = 0;
+
+    function nowMs(){ return performance.now(); }
+
+    function setModeIdle() {
+      if (mode === "idle") return;
+      mode = "idle";
+
+      // Pause & hold
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+      if (DEBUG) console.log("[mp4] MODE -> idle");
     }
 
-    video.addEventListener("loadedmetadata", holdIdleFrame);
-    video.addEventListener("canplay", holdIdleFrame);
-    video.addEventListener("play", () => { if (!speaking) holdIdleFrame(); });
+    async function setModeTalk() {
+      if (mode === "talk") return;
+      mode = "talk";
+      lastTalkStartMs = nowMs();
 
-    // Loop talk segment while speaking
+      video.loop = false;
+      video.playbackRate = TALK_RATE;
+      try { video.currentTime = TALK_START + 0.01; } catch {}
+
+      try { await video.play(); } catch (e) {
+        if (DEBUG) console.log("[mp4] video.play() failed:", e);
+      }
+      if (DEBUG) console.log("[mp4] MODE -> talk");
+    }
+
+    // On load: freeze once metadata is ready (NO "play" handler; that caused the race)
+    video.addEventListener("loadedmetadata", () => {
+      video.pause();
+      try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+    });
+
+    // Loop the talk segment while in talk mode
     video.addEventListener("timeupdate", () => {
-      if (speaking && video.currentTime >= TALK_END) {
+      if (mode === "talk" && video.currentTime >= TALK_END) {
         video.currentTime = TALK_START + 0.01;
       }
     });
@@ -147,24 +164,6 @@
       return Math.sqrt(sum / buf.length);
     }
 
-    async function setSpeaking(on){
-      if (on === speaking) return;
-      speaking = on;
-
-      if (speaking){
-        video.loop = false;
-        video.playbackRate = TALK_RATE;
-        try { video.currentTime = TALK_START + 0.01; } catch {}
-        try { await video.play(); } catch (e) {
-          if (DEBUG) console.log("[mp4] video.play() blocked:", e);
-        }
-        if (DEBUG) console.log("[mp4] SPEAKING ON");
-      } else {
-        holdIdleFrame();
-        if (DEBUG) console.log("[mp4] SPEAKING OFF");
-      }
-    }
-
     function stopAnalyser(){
       if (raf) cancelAnimationFrame(raf);
       raf = null;
@@ -176,14 +175,13 @@
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       await audioCtx.resume();
 
-      // Create source from captured stream
       const source = audioCtx.createMediaStreamSource(stream);
 
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 1024;
       data = new Uint8Array(analyser.fftSize);
 
-      // IMPORTANT: keep graph alive by connecting to a silent output
+      // Keep graph alive (silent)
       const zero = audioCtx.createGain();
       zero.gain.value = 0;
 
@@ -191,61 +189,30 @@
       analyser.connect(zero);
       zero.connect(audioCtx.destination);
 
-      if (DEBUG) {
-        const tracks = stream.getAudioTracks();
-        console.log("[mp4] analyser started (tracks)", tracks.map(t => ({
-          label: t.label,
-          enabled: t.enabled,
-          muted: t.muted,
-          readyState: t.readyState
-        })));
-      }
+      if (DEBUG) console.log("[mp4] analyser started");
 
-      // Auto-calibrate noise floor (helps if RMS is tiny)
-      const t0 = performance.now();
-      let noiseFloor = 0.0005; // start small
       let last = 0;
-      let logTick = 0;
 
       const loop = async () => {
         analyser.getByteTimeDomainData(data);
 
         const rms = computeRMS(data);
-
-        // Update noise floor during calibration window (take low percentile-ish via slow min tracking)
-        if (performance.now() - t0 < CALIBRATION_MS) {
-          // smooth toward low values
-          noiseFloor = Math.min(noiseFloor, rms) * 0.98 + rms * 0.02;
-          // keep it from collapsing to 0
-          noiseFloor = Math.max(noiseFloor, 0.0002);
-
-          SPEAK_ON  = Math.max(0.002, noiseFloor * ON_MULT);
-          SPEAK_OFF = Math.max(0.001, noiseFloor * OFF_MULT);
-        }
-
-        // Smooth the rms slightly
         last = last * SMOOTHING + rms * (1 - SMOOTHING);
 
-        // Hysteresis
-        if (!speaking && last >= SPEAK_ON) await setSpeaking(true);
-        else if (speaking && last <= SPEAK_OFF) await setSpeaking(false);
+        // Decide talking / idle with debounce
+        if (mode !== "talk" && last >= SPEAK_ON) {
+          await setModeTalk();
+        } else if (mode === "talk") {
+          const elapsed = nowMs() - lastTalkStartMs;
 
-        // Occasional debug
-        if (DEBUG) {
-          logTick++;
-          if (logTick % 20 === 0) {
-            console.log(
-              "[mp4] rms:", rms.toFixed(5),
-              "smoothed:", last.toFixed(5),
-              "on:", SPEAK_ON.toFixed(5),
-              "off:", SPEAK_OFF.toFixed(5)
-            );
+          // Only allow turning off after MIN_TALK_MS
+          if (elapsed >= MIN_TALK_MS && last <= SPEAK_OFF) {
+            setModeIdle();
           }
         }
 
         raf = requestAnimationFrame(loop);
       };
-
       loop();
     }
 
@@ -256,24 +223,24 @@
       startAnalyserFromStream(stream).catch(e => DEBUG && console.log("[mp4] analyser error:", e));
     }
 
-    // Arm everything on first user gesture (clicking call button counts)
+    // Arm on first user gesture (clicking widget call button counts)
     window.addEventListener("pointerdown", () => {
       if (armed) return;
       armed = true;
 
-      holdIdleFrame();
+      // Start in idle mode
+      setModeIdle();
 
-      // When a remote audio track arrives, bind immediately
+      // Bind to WebRTC track stream as soon as it arrives
       if (window.__lipTap) {
         window.__lipTap.onStream = (s) => bindOnceFromStream(s);
-
-        // If already available
         if (window.__lipTap.stream) bindOnceFromStream(window.__lipTap.stream);
       }
     }, { capture: true });
 
-    // Initial freeze
-    holdIdleFrame();
+    // Initial freeze (in case metadata already loaded)
+    video.pause();
+    try { video.currentTime = IDLE_HOLD_TIME; } catch {}
   </script>
 </body>
 </html>
