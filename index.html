@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Voice Bot – MP4 Avatar (Talk Only On Bot Audio)</title>
+  <title>Voice Bot – MP4 Avatar</title>
 
   <style>
     html, body { height: 100%; margin: 0; background: #000; }
@@ -40,7 +40,7 @@
        HOOKS (must be BEFORE widget loads)
        ========================================================= -->
 
-  <!-- RTCPeerConnection hook -->
+  <!-- RTCPeerConnection hook (lets us access the remote audio track) -->
   <script>
     (function () {
       window.__lipTap = { stream: null, pcSeen: 0, onStream: null };
@@ -86,44 +86,38 @@
     /* ===================== CONFIG ===================== */
 
     // Freeze on a neutral frame while silent
-    const IDLE_HOLD_TIME = 0.00;  // try 0.20 if frame 0 isn't neutral
+    const IDLE_HOLD_TIME = 0.00;   // try 0.20 if frame 0 isn't neutral
 
-    // Talk loop: full ~4s clip
+    // Talk loop (full ~4s clip; avoid exact end)
     const TALK_START = 0.00;
     const TALK_END   = 3.98;
     const TALK_RATE  = 1.08;
 
-    // Speech detection
-    const SMOOTHING  = 0.10;
-    const SPEAK_ON   = 0.010;
-    const SPEAK_OFF  = 0.006;
+    // Speech detection (your RMS logs looked healthy)
+    const SMOOTHING   = 0.10;
+    const SPEAK_ON    = 0.010;
+    const SPEAK_OFF   = 0.006;
     const MIN_TALK_MS = 250;
 
-    // ✅ Ignore the first N ms after call click (ring suppression window)
-    const RING_GRACE_MS = 2000; // change this (e.g., 1500, 2500)
+    // 🔇 Ring suppression: mute ALL audio output for this long after call click
+    const RING_MUTE_MS = 2000; // adjust freely
 
     /* ================================================== */
 
     let armed = false;
     let bound = false;
 
+    // video state machine
+    let mode = "idle"; // "idle" | "talk"
+    let lastTalkStartMs = 0;
+
+    // analyser state
     let audioCtx = null;
     let analyser = null;
     let data = null;
     let raf = null;
 
-    let mode = "idle"; // "idle" | "talk"
-    let lastTalkStartMs = 0;
-
-    // Timestamp of call click
-    let callStartMs = 0;
-
     function nowMs(){ return performance.now(); }
-
-    function inRingGrace(){
-      if (!callStartMs) return true;
-      return (nowMs() - callStartMs) < RING_GRACE_MS;
-    }
 
     function setModeIdle() {
       if (mode === "idle") return;
@@ -144,7 +138,7 @@
       try { await video.play(); } catch {}
     }
 
-    // Freeze once metadata is ready
+    // Freeze once metadata is ready (prevents autoplay-like behavior)
     video.addEventListener("loadedmetadata", () => {
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
@@ -183,7 +177,7 @@
       analyser.fftSize = 1024;
       data = new Uint8Array(analyser.fftSize);
 
-      // Keep graph alive (silent)
+      // Keep graph alive (silent output)
       const zero = audioCtx.createGain();
       zero.gain.value = 0;
 
@@ -199,14 +193,7 @@
         const rms = computeRMS(data);
         last = last * SMOOTHING + rms * (1 - SMOOTHING);
 
-        // ✅ Ring suppression: force idle during grace window
-        if (inRingGrace()) {
-          if (mode !== "idle") setModeIdle();
-          raf = requestAnimationFrame(loop);
-          return;
-        }
-
-        // Normal talk/idle logic after grace window
+        // Normal talk/idle logic with debounce
         if (mode !== "talk" && last >= SPEAK_ON) {
           await setModeTalk();
         } else if (mode === "talk") {
@@ -227,15 +214,42 @@
       startAnalyserFromStream(stream).catch(()=>{});
     }
 
-    // Arm on first user gesture (call click)
+    /* =========================================================
+       GLOBAL AUDIO MUTE (RING KILL)
+       =========================================================
+       This is a demo-safe blunt tool: it mutes ALL audio output for
+       RING_MUTE_MS immediately after clicking start call, then releases.
+       ========================================================= */
+
+    let globalMuteCtx = null;
+
+    async function muteAllAudioFor(ms){
+      try{
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+
+        if (!globalMuteCtx) globalMuteCtx = new AC();
+
+        // Ensure it's running then suspend to silence output
+        await globalMuteCtx.resume();
+        await globalMuteCtx.suspend();
+
+        setTimeout(async () => {
+          try { await globalMuteCtx.resume(); } catch {}
+        }, ms);
+      } catch {}
+    }
+
+    // Arm on first user gesture (clicking widget call button counts)
     window.addEventListener("pointerdown", () => {
       if (armed) return;
       armed = true;
 
-      // Start ring grace timer NOW (the moment user clicks start call)
-      callStartMs = nowMs();
+      // 🔇 Kill the ring (adjust RING_MUTE_MS at top)
+      muteAllAudioFor(RING_MUTE_MS);
 
-      // Force idle frame immediately
+      // Start in idle frame immediately
+      mode = "idle";
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
 
