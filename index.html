@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Voice Bot – MP4 Avatar</title>
+  <title>Voice Bot – MP4 Avatar (Animate Only On Bot Audio)</title>
 
   <style>
     html, body {
@@ -61,30 +61,59 @@
        CONFIG
        ========================================================= */
 
-    // Full-video talk loop
+    // Hold the avatar perfectly still on this frame while silent
+    const IDLE_HOLD_TIME = 0.00; // try 0.15 / 0.25 if frame 0 isn't neutral
+
+    // Talk loop (full 4s loop; avoid exact end)
     const TALK_START = 0.00;
     const TALK_END   = 3.98;
 
-    const IDLE_RATE  = 1.00;
+    // Playback speed while talking
     const TALK_RATE  = 1.08;
 
+    // Audio->level mapping
     const AUDIO_THRESHOLD = 0.018;
     const AUDIO_GAIN = 12.0;
     const SMOOTHING = 0.10;
 
+    // Hysteresis (prevents flicker)
     const SPEAK_ON  = 0.06;
     const SPEAK_OFF = 0.04;
 
     /* ========================================================= */
 
     let audioCtx, analyser, data;
-    let speaking = false;
     let last = 0;
-    let started = false; // 🔑 prevents auto-start on load
+    let armed = false;
+    let speaking = false;
+    let haveEverSpoken = false;
 
-    // Ensure video is paused on load
-    video.pause();
-    video.currentTime = 0;
+    // --- Ensure the video NEVER plays on load (even if browser tries) ---
+    function holdIdleFrame() {
+      video.pause();
+      // Setting currentTime is safe after metadata is available; if not, it will apply later
+      try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+    }
+
+    // On any event that might cause playback, force pause until bot audio says "speak"
+    video.addEventListener("play", () => {
+      if (!speaking) holdIdleFrame();
+    });
+
+    video.addEventListener("loadedmetadata", () => {
+      holdIdleFrame();
+    });
+
+    video.addEventListener("canplay", () => {
+      holdIdleFrame();
+    });
+
+    // Keep looping talk segment while speaking
+    video.addEventListener("timeupdate", () => {
+      if (speaking && video.currentTime >= TALK_END) {
+        video.currentTime = TALK_START + 0.01;
+      }
+    });
 
     function computeRMS(buf){
       let sum = 0;
@@ -95,30 +124,34 @@
       return Math.sqrt(sum / buf.length);
     }
 
-    function setSpeaking(on){
+    async function setSpeaking(on){
       if (on === speaking) return;
       speaking = on;
 
-      if (speaking){
+      if (speaking) {
+        haveEverSpoken = true;
+
+        // Start / continue talk animation
         video.loop = false;
         video.playbackRate = TALK_RATE;
-        video.currentTime = TALK_START + 0.01;
+
+        // Jump into talk loop immediately
+        try { video.currentTime = TALK_START + 0.01; } catch {}
+
+        // Play (must succeed because we are armed via user gesture + muted video)
+        try { await video.play(); } catch {}
+
       } else {
-        video.playbackRate = IDLE_RATE;
-        video.loop = true;
+        // Stop animation completely when silent
+        holdIdleFrame();
       }
     }
-
-    video.addEventListener("timeupdate", () => {
-      if (speaking && video.currentTime >= TALK_END){
-        video.currentTime = TALK_START + 0.01;
-      }
-    });
 
     async function hookBotAudio(){
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       await audioCtx.resume();
 
+      // Find widget audio
       const findAudio = async () => {
         const start = performance.now();
         while (performance.now() - start < 15000){
@@ -146,7 +179,7 @@
 
       source.connect(analyser);
 
-      const loop = () => {
+      const loop = async () => {
         analyser.getByteTimeDomainData(data);
 
         const rms = computeRMS(data);
@@ -155,29 +188,31 @@
 
         last = last * SMOOTHING + level * (1 - SMOOTHING);
 
-        if (!speaking && last >= SPEAK_ON) setSpeaking(true);
-        else if (speaking && last <= SPEAK_OFF) setSpeaking(false);
+        if (!speaking && last >= SPEAK_ON) await setSpeaking(true);
+        else if (speaking && last <= SPEAK_OFF) await setSpeaking(false);
 
         requestAnimationFrame(loop);
       };
       loop();
     }
 
-    // 🔑 Start EVERYTHING on first user interaction (call click)
-    window.addEventListener("pointerdown", async () => {
-      if (started) return;
-      started = true;
+    // Arm only on first user interaction (clicking the WebRTC call button counts)
+    window.addEventListener("pointerdown", () => {
+      if (armed) return;
+      armed = true;
 
-      // Start video
-      try {
-        await video.play();
-      } catch {}
+      // Keep it still immediately after arming until bot audio truly starts
+      holdIdleFrame();
 
-      // Hook audio
-      hookBotAudio().catch(()=>{});
+      hookBotAudio().catch(() => {});
     }, { capture: true });
+
+    // As a fallback: keep holding the idle frame if user never interacts
+    holdIdleFrame();
   </script>
 </body>
 </html>
+
+
 
 
