@@ -85,21 +85,22 @@
 
     /* ===================== CONFIG ===================== */
 
-    const IDLE_HOLD_TIME = 0.00;  // choose a neutral frame if needed (e.g., 0.20)
+    // Freeze on a neutral frame while silent
+    const IDLE_HOLD_TIME = 0.00;  // try 0.20 if frame 0 isn't neutral
 
+    // Talk loop: full ~4s clip
     const TALK_START = 0.00;
     const TALK_END   = 3.98;
     const TALK_RATE  = 1.08;
 
-    // Your RMS looks healthy; these are safe thresholds
+    // Speech detection
     const SMOOTHING  = 0.10;
     const SPEAK_ON   = 0.010;
     const SPEAK_OFF  = 0.006;
-
-    // Prevent flicker/races: keep talking for at least this long once it starts
     const MIN_TALK_MS = 250;
 
-    const DEBUG = false; // set true if you want logs
+    // ✅ Ignore the first N ms after call click (ring suppression window)
+    const RING_GRACE_MS = 2000; // change this (e.g., 1500, 2500)
 
     /* ================================================== */
 
@@ -111,20 +112,24 @@
     let data = null;
     let raf = null;
 
-    // Video state machine
     let mode = "idle"; // "idle" | "talk"
     let lastTalkStartMs = 0;
 
+    // Timestamp of call click
+    let callStartMs = 0;
+
     function nowMs(){ return performance.now(); }
+
+    function inRingGrace(){
+      if (!callStartMs) return true;
+      return (nowMs() - callStartMs) < RING_GRACE_MS;
+    }
 
     function setModeIdle() {
       if (mode === "idle") return;
       mode = "idle";
-
-      // Pause & hold
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
-      if (DEBUG) console.log("[mp4] MODE -> idle");
     }
 
     async function setModeTalk() {
@@ -136,19 +141,16 @@
       video.playbackRate = TALK_RATE;
       try { video.currentTime = TALK_START + 0.01; } catch {}
 
-      try { await video.play(); } catch (e) {
-        if (DEBUG) console.log("[mp4] video.play() failed:", e);
-      }
-      if (DEBUG) console.log("[mp4] MODE -> talk");
+      try { await video.play(); } catch {}
     }
 
-    // On load: freeze once metadata is ready (NO "play" handler; that caused the race)
+    // Freeze once metadata is ready
     video.addEventListener("loadedmetadata", () => {
       video.pause();
       try { video.currentTime = IDLE_HOLD_TIME; } catch {}
     });
 
-    // Loop the talk segment while in talk mode
+    // Loop talk segment while talking
     video.addEventListener("timeupdate", () => {
       if (mode === "talk" && video.currentTime >= TALK_END) {
         video.currentTime = TALK_START + 0.01;
@@ -189,8 +191,6 @@
       analyser.connect(zero);
       zero.connect(audioCtx.destination);
 
-      if (DEBUG) console.log("[mp4] analyser started");
-
       let last = 0;
 
       const loop = async () => {
@@ -199,13 +199,18 @@
         const rms = computeRMS(data);
         last = last * SMOOTHING + rms * (1 - SMOOTHING);
 
-        // Decide talking / idle with debounce
+        // ✅ Ring suppression: force idle during grace window
+        if (inRingGrace()) {
+          if (mode !== "idle") setModeIdle();
+          raf = requestAnimationFrame(loop);
+          return;
+        }
+
+        // Normal talk/idle logic after grace window
         if (mode !== "talk" && last >= SPEAK_ON) {
           await setModeTalk();
         } else if (mode === "talk") {
           const elapsed = nowMs() - lastTalkStartMs;
-
-          // Only allow turning off after MIN_TALK_MS
           if (elapsed >= MIN_TALK_MS && last <= SPEAK_OFF) {
             setModeIdle();
           }
@@ -219,26 +224,29 @@
     function bindOnceFromStream(stream){
       if (bound) return;
       bound = true;
-      if (DEBUG) console.log("[mp4] bound from WebRTC track stream");
-      startAnalyserFromStream(stream).catch(e => DEBUG && console.log("[mp4] analyser error:", e));
+      startAnalyserFromStream(stream).catch(()=>{});
     }
 
-    // Arm on first user gesture (clicking widget call button counts)
+    // Arm on first user gesture (call click)
     window.addEventListener("pointerdown", () => {
       if (armed) return;
       armed = true;
 
-      // Start in idle mode
-      setModeIdle();
+      // Start ring grace timer NOW (the moment user clicks start call)
+      callStartMs = nowMs();
 
-      // Bind to WebRTC track stream as soon as it arrives
+      // Force idle frame immediately
+      video.pause();
+      try { video.currentTime = IDLE_HOLD_TIME; } catch {}
+
+      // Bind to WebRTC stream when it arrives
       if (window.__lipTap) {
         window.__lipTap.onStream = (s) => bindOnceFromStream(s);
         if (window.__lipTap.stream) bindOnceFromStream(window.__lipTap.stream);
       }
     }, { capture: true });
 
-    // Initial freeze (in case metadata already loaded)
+    // Initial freeze
     video.pause();
     try { video.currentTime = IDLE_HOLD_TIME; } catch {}
   </script>
