@@ -34,3 +34,206 @@
     <video
       id="avatarVideo"
       src="./SKO NiCY Animation Speech.mp4"
+      muted
+      playsinline
+      preload="auto"
+    ></video>
+  </div>
+
+  <!-- =========================================================
+       GLOBAL MEDIA MUTE (RING SUPPRESSION – SAFE)
+       ========================================================= -->
+  <script>
+    (function () {
+      if (window.__mediaMuteInstalled) return;
+      window.__mediaMuteInstalled = true;
+
+      const proto = HTMLMediaElement.prototype;
+      const origPlay = proto.play;
+
+      window.__forceMediaMuted = true;
+
+      proto.play = function () {
+        this.muted = window.__forceMediaMuted;
+        return origPlay.apply(this, arguments);
+      };
+
+      function muteAll() {
+        document.querySelectorAll("audio,video")
+          .forEach(m => m.muted = true);
+      }
+      function unmuteAll() {
+        document.querySelectorAll("audio,video")
+          .forEach(m => m.muted = false);
+      }
+
+      window.__muteAllMedia = muteAll;
+      window.__unmuteAllMedia = unmuteAll;
+
+      muteAll(); // mute immediately on load
+    })();
+  </script>
+
+  <!-- =========================================================
+       WebRTC TRACK TAP (for lip-sync)
+       ========================================================= -->
+  <script>
+    (function () {
+      window.__lipTap = { stream: null, onStream: null };
+
+      const OrigPC = window.RTCPeerConnection;
+      if (!OrigPC) return;
+
+      function WrappedPC(...args) {
+        const pc = new OrigPC(...args);
+        pc.addEventListener("track", ev => {
+          if (ev.track && ev.track.kind === "audio") {
+            const stream = ev.streams?.[0] || new MediaStream([ev.track]);
+            window.__lipTap.stream = stream;
+            if (window.__lipTap.onStream) window.__lipTap.onStream(stream);
+          }
+        });
+        return pc;
+      }
+      WrappedPC.prototype = OrigPC.prototype;
+      window.RTCPeerConnection = WrappedPC;
+    })();
+  </script>
+
+  <!-- =========================================================
+       Cognigy WebRTC Widget
+       ========================================================= -->
+  <script src="https://static-trial.cognigy.ai/webrtc/webRTCWidget.js"></script>
+  <script>
+    addEventListener("load", () => {
+      window.initWebRTCWidget?.(
+        "https://endpoint-trial-us.cognigy.ai/43947422bffcca503a42c2b9b03611a5f85c57045d9a05957c16111e450de980"
+      );
+    });
+  </script>
+
+  <!-- =========================================================
+       MP4 LIP SYNC ENGINE
+       ========================================================= -->
+  <script>
+    const video = document.getElementById("avatarVideo");
+
+    const IDLE_FRAME = 0.0;
+    const TALK_START = 0.0;
+    const TALK_END   = 3.98;
+    const TALK_RATE  = 1.08;
+
+    const SPEAK_ON   = 0.010;
+    const SPEAK_OFF  = 0.006;
+    const SMOOTHING  = 0.10;
+    const MIN_TALK_MS = 250;
+
+    let mode = "idle";
+    let lastTalkStart = 0;
+    let bound = false;
+
+    function now(){ return performance.now(); }
+
+    function idle(){
+      if (mode === "idle") return;
+      mode = "idle";
+      video.pause();
+      try { video.currentTime = IDLE_FRAME; } catch {}
+    }
+
+    async function talk(){
+      if (mode === "talk") return;
+      mode = "talk";
+      lastTalkStart = now();
+      video.loop = false;
+      video.playbackRate = TALK_RATE;
+      try { video.currentTime = TALK_START + 0.01; } catch {}
+      try { await video.play(); } catch {}
+    }
+
+    video.addEventListener("loadedmetadata", () => {
+      video.pause();
+      video.currentTime = IDLE_FRAME;
+    });
+
+    video.addEventListener("timeupdate", () => {
+      if (mode === "talk" && video.currentTime >= TALK_END) {
+        video.currentTime = TALK_START + 0.01;
+      }
+    });
+
+    function rms(buf){
+      let s=0;
+      for (let i=0;i<buf.length;i++){
+        const x=(buf[i]-128)/128;
+        s+=x*x;
+      }
+      return Math.sqrt(s/buf.length);
+    }
+
+    async function startLipSync(stream){
+      if (bound) return;
+      bound = true;
+
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      await ctx.resume();
+
+      const src = ctx.createMediaStreamSource(stream);
+      const an  = ctx.createAnalyser();
+      an.fftSize = 1024;
+      const data = new Uint8Array(an.fftSize);
+
+      const g = ctx.createGain();
+      g.gain.value = 0;
+
+      src.connect(an);
+      an.connect(g);
+      g.connect(ctx.destination);
+
+      let last = 0;
+
+      const loop = async () => {
+        an.getByteTimeDomainData(data);
+        const v = rms(data);
+        last = last * SMOOTHING + v * (1 - SMOOTHING);
+
+        if (mode !== "talk" && last >= SPEAK_ON) {
+          await talk();
+        } else if (mode === "talk") {
+          if (now() - lastTalkStart > MIN_TALK_MS && last <= SPEAK_OFF) {
+            idle();
+          }
+        }
+        requestAnimationFrame(loop);
+      };
+      loop();
+    }
+
+    // =========================================================
+    // CALL CLICK HANDLER
+    // =========================================================
+    window.addEventListener("pointerdown", () => {
+      if (window.__callArmed) return;
+      window.__callArmed = true;
+
+      // 🔇 Mute ring immediately
+      window.__forceMediaMuted = true;
+      window.__muteAllMedia();
+
+      // 🔊 Release after 2s (adjust here)
+      setTimeout(() => {
+        window.__forceMediaMuted = false;
+        window.__unmuteAllMedia();
+      }, 2000);
+
+      idle();
+
+      if (window.__lipTap) {
+        window.__lipTap.onStream = s => startLipSync(s);
+        if (window.__lipTap.stream) startLipSync(window.__lipTap.stream);
+      }
+    }, { capture:true });
+  </script>
+</body>
+</html>
