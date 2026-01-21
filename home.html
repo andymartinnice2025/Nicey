@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voice Bot – MP4 Avatar</title>
+
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #000;
+    }
+    .stage{
+      position: relative;
+      width: min(720px, calc(100vw - 24px));
+      aspect-ratio: 1 / 1;
+      margin: 0 auto;
+      display: grid;
+      place-items: center;
+    }
+    video{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: #000;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="stage">
+    <video
+      id="avatarVideo"
+      src="./SKO NiCY Animation Speech.mp4"
